@@ -1297,72 +1297,76 @@ class HandshakeAndReconnectTest {
     }
 
     @Test
-    fun packetsAndStrayAdminDuringSeedingAreBufferedUntilOwnerResponse() = runTest {
+    fun sessionIsReadyBeforeSeedReplyAndALateReplyStaysOffPackets() = runTest {
         val transport = ScriptedTransport(
-            identity = TransportIdentity("fake:seeding-buffer"),
+            identity = TransportIdentity("fake:seed-after-ready"),
             nowMs = { currentTime },
             autoRespondGetOwner = false,
         )
         val client = buildClient(transport)
         val connectJob = backgroundScope.async { client.connect() }
         drainCurrent()
-        // Walk the virtual-time settle windows (Stage-1 settle + heartbeat settle) so the
-        // engine reaches the seeding stage and sends its get_owner_request.
         repeat(3) {
             advanceTimeBy(INTER_STAGE_SETTLE_MS + 1)
             drainCurrent()
         }
 
-        client.packets.test {
-            // Live traffic + a stray (request-shaped) admin packet during the seeding window.
-            transport.injectAlivePacket(packetId = 555)
-            transport.injectFromRadio(
-                org.meshtastic.proto.FromRadio.Builder().also { wb ->
-                    wb.packet = MeshPacket.Builder().also { wb ->
-                        wb.from = 0x0DEAD
-                        wb.to = transport.nodeNum
-                        wb.decoded = Data.Builder().also { wb ->
-                            wb.portnum = PortNum.ADMIN_APP
-                            wb.payload = AdminMessage.ADAPTER
-                                .encode(
-                                    AdminMessage.Builder().also { wb ->
-                                        wb.set_owner =
-                                            User.Builder().also { wb ->
-                                                wb.long_name =
-                                                    "stray"
-                                            }.build()
-                                    }.build(),
-                                )
-                                .toByteString()
-                        }.build()
-                    }.build()
-                }.build(),
-            )
-            drainCurrent()
-            expectNoEvents()
-            assertIs<ConnectionState.Configuring>(client.connection.value)
-            assertFalse(connectJob.isCompleted, "Stray admin must not complete the seeding stage")
+        // A managed node drops local admin, so the seed may never be answered: Ready must not wait.
+        connectJob.await()
+        assertIs<ConnectionState.Connected>(client.connection.value)
+        val seedRequest = transport.outboundPackets().first { adminOf(it)?.get_owner_request == true }
+        assertTrue(seedRequest.id != 0, "The seed carries a packet id so its reply can be matched")
 
-            // Answer the seed; both buffered packets flush through the Ready pipeline.
-            val seedRequest = transport.outboundPackets().first { adminOf(it)?.get_owner_request == true }
+        client.events.test {
+            advanceTimeBy(10_001)
+            drainCurrent()
+            val warning = assertIs<MeshEvent.ProtocolWarning>(awaitItem())
+            assertEquals("session passkey seed timed out", warning.message)
+            cancelAndIgnoreRemainingEvents()
+        }
+        assertIs<ConnectionState.Connected>(client.connection.value, "A seed timeout only warns")
+
+        client.packets.test {
             transport.injectAdminResponse(
                 requestId = seedRequest.id,
                 response = AdminMessage.Builder().also { wb ->
-                    wb.get_owner_response = User.Builder().also { wb ->
-                        wb.id = "!00000001"
-                        wb.long_name = "ScriptedNode"
-                        wb.short_name = "SN"
-                    }.build()
+                    wb.get_owner_response = User.Builder().also { wb -> wb.long_name = "ScriptedNode" }.build()
                     wb.session_passkey = SEEDED_PASSKEY.toByteString()
                 }.build(),
                 fromNode = transport.nodeNum,
             )
+            transport.injectAlivePacket(packetId = 555)
             drainCurrent()
-            connectJob.await()
-            assertEquals(555, awaitItem().id)
-            assertEquals(PortNum.ADMIN_APP, awaitItem().decoded?.portnum)
+            assertEquals(555, awaitItem().id, "The late seed reply is engine-internal")
             cancelAndIgnoreRemainingEvents()
         }
+    }
+
+    @Test
+    fun staleStage1CompletionDuringStage2IsIgnored() = runTest {
+        val transport = ScriptedTransport(
+            identity = TransportIdentity("fake:stale-stage1-nonce"),
+            nowMs = { currentTime },
+            autoCompleteStage2 = false,
+        )
+        val client = buildClient(transport)
+        val connectJob = backgroundScope.async { client.connect() }
+        client.connection.first { it is ConnectionState.Configuring && it.phase == ConfigPhase.Stage2 }
+
+        // Firmware answers both want_config_id requests when the Stage 1 retry fires, so the
+        // retry's completion can land after Stage 2 has started.
+        transport.injectFromRadio(
+            org.meshtastic.proto.FromRadio.Builder().also { wb -> wb.config_complete_id = NONCE_STAGE1 }.build(),
+        )
+        drainCurrent()
+        assertIs<ConnectionState.Configuring>(client.connection.value)
+
+        transport.injectFromRadio(
+            org.meshtastic.proto.FromRadio.Builder().also { wb -> wb.config_complete_id = NONCE_STAGE2 }.build(),
+        )
+        drainCurrent()
+        connectJob.await()
+        assertIs<ConnectionState.Connected>(client.connection.value)
     }
 
     @Test

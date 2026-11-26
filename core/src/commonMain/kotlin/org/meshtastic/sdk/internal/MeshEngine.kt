@@ -372,6 +372,10 @@ internal class MeshEngine(
     private var stage2ProgressCounter: Long = 0L
     private var stage2WatchdogJob: Job? = null
 
+    /** Packet id of the unanswered post-Ready `get_owner_request` seed; 0 when none. */
+    private var seedRequestId = 0
+    private var seedTimeoutJob: Job? = null
+
     /** rate-limit clock for the encrypted-packet ACK-skip warning. */
     private var lastEncryptedSkipWarningAtMs: Long = 0L
 
@@ -762,6 +766,7 @@ internal class MeshEngine(
         stage2WatchdogJob?.cancel()
         stage2WatchdogJob = null
         stage2ProgressCounter = 0L
+        clearSessionSeed()
         lastEncryptedSkipWarningAtMs = 0L
         recentInboundPacketKeys.clear()
         recentInboundPacketKeySet.clear()
@@ -833,6 +838,8 @@ internal class MeshEngine(
             EngineMessage.PresenceCheckTick -> handlePresenceCheckTick()
 
             is EngineMessage.HandshakeTimeout -> handleHandshakeTimeout(msg)
+
+            is EngineMessage.SessionSeedTimeout -> handleSessionSeedTimeout(msg)
 
             is EngineMessage.HandshakeStage1SettleComplete -> if (msg.attempt ==
                 handshakeAttempt
@@ -1626,8 +1633,7 @@ internal class MeshEngine(
             handleAuxiliaryFromRadioVariant(fromRadio, HandshakeStage.Stage2Draining) -> Unit
 
             completeId == NONCE_STAGE2 -> {
-                logger.info(TAG) { "Stage 2 complete; seeding session passkey" }
-                handshakeStage = HandshakeStage.SeedingSession
+                logger.info(TAG) { "Stage 2 complete; going Ready and seeding session passkey" }
                 // leaving Stage2Draining — cancel the sliding watchdog so it doesn't
                 // post a stale HandshakeTimeout message after we've already advanced.
                 stage2WatchdogJob?.cancel()
@@ -1752,24 +1758,23 @@ internal class MeshEngine(
                     }
                 }
 
-                // Send get_owner_request to seed the session passkey.
-                if (myNodeNum != 0) {
-                    sendAdminPacket(
-                        AdminMessage.Builder().also { wb ->
-                            wb.get_owner_request = true
-                        }.build(),
-                        wantResponse = true,
-                    )
-                    val attempt = handshakeAttempt
-                    engineScope?.launch {
-                        delay(SEED_TIMEOUT_MS)
-                        inbox.trySend(EngineMessage.HandshakeTimeout(HandshakeStage.SeedingSession, attempt))
-                    }
-                } else {
-                    // No myInfo: skip seeding and go Ready.
-                    transitionToReady()
+                logger.info(TAG) {
+                    val managed = meshState.configBundle?.configs?.any { it.security?.is_managed == true } == true
+                    "Local node 0x${myNodeNum.toString(16)} is_managed=$managed"
                 }
+
+                // Ready here, before the seed reply: firmware replays its stored packets right after
+                // this completion (PhoneAPI::sendConfigComplete), more than the handshake buffer
+                // holds, and a managed node drops local admin (AdminModule: from == 0 && is_managed)
+                // so the reply may never come. Local admin needs no passkey (firmware checks it only
+                // when from != 0); the Ready path latches the reply whenever it arrives.
+                if (myNodeNum != 0) sendSessionSeed()
+                transitionToReady()
             }
+
+            // A late completion for the Stage 1 retry (handleStage1RetryWantConfig re-sends
+            // NONCE_STAGE1, and firmware answers both requests) is stale, not a protocol violation.
+            completeId == NONCE_STAGE1 -> logger.debug(TAG) { "Stage 2: ignoring stale Stage 1 completion" }
 
             // see Stage 1 comment above — only a *set* mismatching completion nonce is a
             // protocol violation; a null/unrecognized FromRadio is tolerated.
@@ -1815,6 +1820,50 @@ internal class MeshEngine(
             // unsolicited admin traffic (e.g. external config change) — deliver post-Ready.
             bufferHandshakePacket(packet)
         }
+    }
+
+    private fun sendSessionSeed() {
+        val id = nextMessageId().raw
+        sendAdminPacket(
+            AdminMessage.Builder().also { wb -> wb.get_owner_request = true }.build(),
+            wantResponse = true,
+            id = id,
+        )
+        seedRequestId = id
+        seedTimeoutJob?.cancel()
+        seedTimeoutJob = engineScope?.launch {
+            delay(SEED_TIMEOUT_MS)
+            inbox.trySend(EngineMessage.SessionSeedTimeout(id))
+        }
+    }
+
+    // Firmware answers with request_id = the seed's packet id (MeshModule::setReplyTo). The reply is
+    // engine-internal, so it latches the passkey and stays off the packets flow.
+    private fun consumeSessionSeedReply(packet: MeshPacket): Boolean {
+        val decoded = packet.decoded ?: return false
+        if (seedRequestId == 0 || decoded.portnum != PortNum.ADMIN_APP || decoded.request_id != seedRequestId) {
+            return false
+        }
+        if (packet.from != 0 && packet.from != myNodeNum) return false
+        val adminMsg = runCatching { AdminMessage.ADAPTER.decode(decoded.payload) }.getOrNull() ?: return false
+        if (adminMsg.get_owner_response == null) return false
+        clearSessionSeed()
+        latchSessionPasskey(myNodeNum, adminMsg)
+        return true
+    }
+
+    private fun handleSessionSeedTimeout(msg: EngineMessage.SessionSeedTimeout) {
+        if (seedRequestId == 0 || msg.requestId != seedRequestId) return
+        // Only a warning is due: the reply still latches the passkey if it comes later.
+        seedTimeoutJob = null
+        logger.warn(TAG) { "No get_owner_response within ${SEED_TIMEOUT_MS}ms; the session has no local passkey" }
+        events.tryEmit(MeshEvent.ProtocolWarning("session passkey seed timed out"))
+    }
+
+    private fun clearSessionSeed() {
+        seedRequestId = 0
+        seedTimeoutJob?.cancel()
+        seedTimeoutJob = null
     }
 
     /**
@@ -2317,6 +2366,7 @@ internal class MeshEngine(
             return
         }
         mergeLivePacketIntoNodeDb(packet, decoded)
+        if (consumeSessionSeedReply(packet)) return
         emitPacketOrLog(packet)
         // Decode the admin payload once; both the passkey latch and external-change detection
         // need it, and inbound ADMIN_APP traffic is hot during config syncs.
@@ -2879,6 +2929,7 @@ internal class MeshEngine(
         stage2WatchdogJob?.cancel()
         stage2WatchdogJob = null
         stage2ProgressCounter = 0L
+        clearSessionSeed()
         recentInboundPacketKeys.clear()
         recentInboundPacketKeySet.clear()
         resetDisplayMirror()
@@ -3443,12 +3494,18 @@ internal class MeshEngine(
         sendToRadio(ToRadio.Builder().also { wb -> wb.packet = packet }.build())
     }
 
-    private fun sendAdminPacket(adminMsg: AdminMessage, wantResponse: Boolean = false, to: Int = myNodeNum) {
+    private fun sendAdminPacket(
+        adminMsg: AdminMessage,
+        wantResponse: Boolean = false,
+        to: Int = myNodeNum,
+        id: Int = 0,
+    ) {
         if (myNodeNum == 0) return
         val payload = AdminMessage.ADAPTER.encode(adminMsg).toByteString()
         val packet = MeshPacket.Builder().also { wb ->
             wb.to = to
             wb.from = myNodeNum
+            wb.id = id
             wb.decoded = Data.Builder().also { wb ->
                 wb.portnum = PortNum.ADMIN_APP
                 wb.payload = payload

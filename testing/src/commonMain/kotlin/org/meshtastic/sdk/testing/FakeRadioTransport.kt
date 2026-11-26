@@ -80,6 +80,9 @@ public class FakeRadioTransport(
     private val outboundFramesList = mutableListOf<Frame>()
     private var inboundChannel = Channel<Frame>(Channel.UNLIMITED)
 
+    // Only the engine's post-Ready session seed is auto-answered; tests script later getOwner replies.
+    private var ownerSeedAnswered = false
+
     override val state: StateFlow<TransportState> = _state.asStateFlow()
 
     /** Frames that were sent via [send]. */
@@ -263,6 +266,7 @@ public class FakeRadioTransport(
 
     override suspend fun connect() {
         inboundChannel = Channel(Channel.UNLIMITED)
+        ownerSeedAnswered = false
         _state.value = TransportState.Connecting
         for (frame in frames) inboundChannel.trySend(frame)
         _state.value = TransportState.Connected
@@ -358,7 +362,8 @@ public class FakeRadioTransport(
         } catch (_: Exception) {
             return
         }
-        if (admin.get_owner_request == true) {
+        if (admin.get_owner_request == true && !ownerSeedAnswered) {
+            ownerSeedAnswered = true
             val user = User.Builder().also { wb ->
                 wb.id = "!00000001"
                 wb.long_name = "FakeNode"
@@ -377,6 +382,8 @@ public class FakeRadioTransport(
                 wb.decoded = Data.Builder().also { wb ->
                     wb.portnum = PortNum.ADMIN_APP
                     wb.payload = responsePayload
+                    // Firmware replies with request_id = the request's packet id (MeshModule::setReplyTo).
+                    wb.request_id = packet.id
                 }.build()
             }.build()
             injectFromRadio(FromRadio.Builder().also { wb -> wb.packet = responsePacket }.build())

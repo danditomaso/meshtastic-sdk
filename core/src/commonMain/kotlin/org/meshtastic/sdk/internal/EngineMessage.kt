@@ -156,6 +156,9 @@ internal sealed interface EngineMessage {
      */
     data class HandshakeTimeout(val stage: HandshakeStage, val attempt: Long) : EngineMessage
 
+    /** The post-Ready session passkey seed got no `get_owner_response` in time. Warning only. */
+    data class SessionSeedTimeout(val requestId: Int) : EngineMessage
+
     /**
      * The 100 ms inter-stage settle timer (after Stage 1 sentinel received) has elapsed.
      * The engine should now send the inter-stage heartbeat.
